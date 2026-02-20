@@ -1,0 +1,7 @@
+.env
+venv/
+piper/
+test_piper_latency.py
+test_tts_latency.py
+setup_piper.sh
+__pycache__
