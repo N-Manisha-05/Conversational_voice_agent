@@ -32,8 +32,9 @@ Use contractions. No bullet points. No markdown. Speak like a human, not a docum
 conversation_history = []
 current_task: asyncio.Task | None = None
 is_speaking = False
+speaking_lock = asyncio.Lock()   # ADD THIS
 last_interrupt_time = 0
-INTERRUPT_COOLDOWN = 0.5  # seconds
+INTERRUPT_COOLDOWN = 0.5
 
 
 # ── LLM ───────────────────────────────────────────────────────────
@@ -84,9 +85,10 @@ async def handle_turn(transcript: str, show_user_text: bool = True):
         async for sentence in ask_groq_streaming(transcript):
             print(sentence, end=" ", flush=True)
             await asyncio.sleep(0)
-            is_speaking = True
-            await speak_sentence(sentence)
-            is_speaking = False
+            async with speaking_lock:
+                is_speaking = True
+                await speak_sentence(sentence)
+                is_speaking = False
         print()
     except asyncio.CancelledError:
         stop_speaking()
@@ -170,12 +172,10 @@ async def main():
             ))
 
             try:
-                if is_speaking:
-                    await asyncio.to_thread(dg_live.send, silence.tobytes())
-                else:
-                    await asyncio.to_thread(dg_live.send, pcm_int16.tobytes())
+                data_to_send = silence.tobytes() if is_speaking else pcm_int16.tobytes()
+                await asyncio.to_thread(dg_live.send, data_to_send)
             except Exception as e:
-                print(f"[dg send error] {e}")
+                print("[Deepgram send error]", e)
 
 
     async def handle_vad_events():
@@ -188,12 +188,10 @@ async def main():
                     if now - last_interrupt_time > INTERRUPT_COOLDOWN:
                         # Clear is_speaking FIRST so feed_audio resumes
                         # sending real audio to Deepgram immediately
-                        is_speaking = False
-                        stop_speaking()
-                        # Let PortAudio fully release the stream thread
-                        await asyncio.sleep(0.1)
                         if current_task and not current_task.done():
                             current_task.cancel()
+                        stop_speaking()
+                        is_speaking = False
                         print("\n[barge-in detected]")
                         last_interrupt_time = now
 

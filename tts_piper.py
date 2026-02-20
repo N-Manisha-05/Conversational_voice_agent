@@ -44,15 +44,18 @@ async def speak_sentence(text: str):
 
         sd.play(audio_data, samplerate=SAMPLE_RATE)
 
+        loop = asyncio.get_event_loop()
+        fut = loop.run_in_executor(None, sd.wait)
+
         try:
-            await asyncio.get_event_loop().run_in_executor(None, sd.wait)
+            await asyncio.shield(fut)
         except asyncio.CancelledError:
             sd.stop()
-            # Give PortAudio time to fully release the stream thread
-            # before any new sd.play() call — prevents pthread_join segfault
-            await asyncio.sleep(0.1)
             raise
 
 
 def stop_speaking():
-    sd.stop()
+    try:
+        sd.stop()
+    except Exception:
+        pass
