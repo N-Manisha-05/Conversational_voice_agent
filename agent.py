@@ -15,9 +15,6 @@ from tts_piper import speak_sentence, stop_speaking
 load_dotenv()
 
 
-
-
-
 SAMPLE_RATE = 16000
 
 CHUNK_SAMPLES = 480
@@ -32,9 +29,20 @@ Use contractions. No bullet points. No markdown. Speak like a human, not a docum
 conversation_history = []
 current_task: asyncio.Task | None = None
 is_speaking = False
-speaking_lock = asyncio.Lock()   # ADD THIS
+speaking_lock = asyncio.Lock()
 last_interrupt_time = 0
 INTERRUPT_COOLDOWN = 0.5
+
+# ── Tunable constants ─────────────────────────────────────────────
+# RMS energy threshold: reject speaker echo, pass real user speech
+BARGE_IN_ENERGY_THRESHOLD = 0.05
+# After TTS stops, keep VAD muted this long to catch trailing echo
+POST_SPEECH_MUTE_SECS = 0.6
+# How long to wait for more transcript fragments before dispatching
+TRANSCRIPT_DEBOUNCE_SECS = 1.0
+
+# Timestamp when speaking ended (for post-speech cooldown)
+speaking_ended_at: float = 0.0
 
 
 # ── LLM ───────────────────────────────────────────────────────────
@@ -75,7 +83,7 @@ async def ask_groq_streaming(user_text: str):
 
 # ── HANDLE ONE TURN ───────────────────────────────────────────────
 async def handle_turn(transcript: str, show_user_text: bool = True):
-    global is_speaking
+    global is_speaking, speaking_ended_at
     try:
         if not transcript.strip():
             return
@@ -89,13 +97,16 @@ async def handle_turn(transcript: str, show_user_text: bool = True):
                 is_speaking = True
                 await speak_sentence(sentence)
                 is_speaking = False
+                speaking_ended_at = asyncio.get_event_loop().time()
         print()
     except asyncio.CancelledError:
         stop_speaking()
         is_speaking = False
+        speaking_ended_at = asyncio.get_event_loop().time()
     except Exception as e:
         print(f"\n[error] {e}")
         is_speaking = False
+        speaking_ended_at = asyncio.get_event_loop().time()
 
 
 # ── MAIN ──────────────────────────────────────────────────────────
@@ -135,7 +146,7 @@ async def main():
         smart_format=True,
         punctuate=True,
         interim_results=True,
-        utterance_end_ms="1000",
+        utterance_end_ms="1500",
         vad_events=False,
         encoding="linear16",
         sample_rate=SAMPLE_RATE,
@@ -177,12 +188,23 @@ async def main():
             chunk = await audio_queue.get()
             pcm_int16 = (np.clip(chunk, -1.0, 1.0) * 32767).astype(np.int16)
 
-            vad_stream.push_frame(AudioFrame(
-                data=pcm_int16.tobytes(),
-                sample_rate=SAMPLE_RATE,
-                num_channels=1,
-                samples_per_channel=len(pcm_int16),
-            ))
+            # Echo suppression: mute VAD while speaking OR during
+            # the post-speech cooldown window (trailing echo).
+            now = asyncio.get_event_loop().time()
+            in_cooldown = (now - speaking_ended_at) < POST_SPEECH_MUTE_SECS
+
+            feed_vad = True
+            if is_speaking or in_cooldown:
+                rms = np.sqrt(np.mean(chunk ** 2))
+                feed_vad = rms > BARGE_IN_ENERGY_THRESHOLD
+
+            if feed_vad:
+                vad_stream.push_frame(AudioFrame(
+                    data=pcm_int16.tobytes(),
+                    sample_rate=SAMPLE_RATE,
+                    num_channels=1,
+                    samples_per_channel=len(pcm_int16),
+                ))
 
             try:
                 data_to_send = silence.tobytes() if is_speaking else pcm_int16.tobytes()
@@ -209,13 +231,36 @@ async def main():
                         last_interrupt_time = now
 
     async def handle_transcripts():
+        """Debounce Deepgram transcripts to avoid splitting one
+        user utterance across multiple turns."""
         global current_task
+        buffer: list[str] = []
+
         while True:
-            transcript = await transcript_queue.get()
+            # Wait for the first fragment
+            if not buffer:
+                fragment = await transcript_queue.get()
+                buffer.append(fragment)
+
+            # Keep collecting fragments until the debounce window elapses
+            while True:
+                try:
+                    next_frag = await asyncio.wait_for(
+                        transcript_queue.get(),
+                        timeout=TRANSCRIPT_DEBOUNCE_SECS,
+                    )
+                    buffer.append(next_frag)
+                except asyncio.TimeoutError:
+                    break  # debounce window elapsed, time to process
+
+            combined = " ".join(buffer)
+            buffer.clear()
+
+            # Cancel any in-progress response
             if current_task and not current_task.done():
                 current_task.cancel()
                 stop_speaking()
-            current_task = asyncio.create_task(handle_turn(transcript))
+            current_task = asyncio.create_task(handle_turn(combined))
 
     print("Listening. Press Ctrl+C to stop.\n")
 
