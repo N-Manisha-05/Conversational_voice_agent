@@ -1,5 +1,6 @@
 import asyncio
 import os
+import threading
 import numpy as np
 import sounddevice as sd
 
@@ -7,6 +8,24 @@ import sounddevice as sd
 PIPER_BINARY = os.path.abspath("./piper/piper")
 MODEL_PATH = os.path.abspath("./piper/en_US-lessac-medium.onnx")
 SAMPLE_RATE = 22050  # Piper uses 22050Hz for this model
+PLAYBACK_BLOCK = 1024  # frames per write to the output stream
+
+# Global stop event for interrupting playback
+_stop_event = threading.Event()
+
+
+def _play_audio_blocking(audio_data: np.ndarray):
+    """Play audio using a dedicated OutputStream (avoids conflicts with InputStream)."""
+    _stop_event.clear()
+    idx = 0
+    total = len(audio_data)
+
+    with sd.OutputStream(samplerate=SAMPLE_RATE, channels=1, dtype='float32') as stream:
+        while idx < total and not _stop_event.is_set():
+            end = min(idx + PLAYBACK_BLOCK, total)
+            chunk = audio_data[idx:end]
+            stream.write(chunk.reshape(-1, 1))
+            idx = end
 
 
 async def speak_sentence(text: str):
@@ -42,20 +61,16 @@ async def speak_sentence(text: str):
     if raw_audio:
         audio_data = np.frombuffer(raw_audio, dtype=np.int16).astype(np.float32) / 32767.0
 
-        sd.play(audio_data, samplerate=SAMPLE_RATE)
-
         loop = asyncio.get_event_loop()
-        fut = loop.run_in_executor(None, sd.wait)
-
         try:
-            await asyncio.shield(fut)
+            await asyncio.shield(
+                loop.run_in_executor(None, _play_audio_blocking, audio_data)
+            )
         except asyncio.CancelledError:
-            sd.stop()
+            _stop_event.set()
             raise
 
 
 def stop_speaking():
-    try:
-        sd.stop()
-    except Exception:
-        pass
+    """Signal the playback thread to stop immediately."""
+    _stop_event.set()

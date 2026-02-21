@@ -151,12 +151,25 @@ async def main():
         loop.call_soon_threadsafe(audio_queue.put_nowait, chunk)
 
     async def keepalive():
+        """Send Deepgram KeepAlive every 5s to prevent connection timeout."""
         while True:
-            await asyncio.sleep(2)
+            await asyncio.sleep(5)
             try:
                 await asyncio.to_thread(dg_live.keep_alive)
             except Exception:
                 pass
+
+    async def send_silence_while_speaking():
+        """Continuously feed silence to Deepgram while TTS is active,
+        independent of the mic audio queue, to prevent timeout."""
+        silence = np.zeros(CHUNK_SAMPLES, dtype=np.int16).tobytes()
+        while True:
+            await asyncio.sleep(0.05)  # 50ms interval
+            if is_speaking:
+                try:
+                    await asyncio.to_thread(dg_live.send, silence)
+                except Exception:
+                    pass
 
     async def feed_audio():
         silence = np.zeros(CHUNK_SAMPLES, dtype=np.int16)
@@ -221,6 +234,7 @@ async def main():
             handle_vad_events(),
             handle_transcripts(),
             keepalive(),
+            send_silence_while_speaking(),
         )
     finally:
         mic_stream.stop()
