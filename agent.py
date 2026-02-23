@@ -146,7 +146,7 @@ async def main():
         smart_format=True,
         punctuate=True,
         interim_results=True,
-        utterance_end_ms="1500",
+        utterance_end_ms="2000",
         vad_events=False,
         encoding="linear16",
         sample_rate=SAMPLE_RATE,
